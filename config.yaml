@@ -1,0 +1,24 @@
+training:
+  epochs: 5
+  batch_size: 256
+  accumulation_steps: 2
+  learning_rate: 0.0003
+  weight_decay: 0.1
+  grad_clip: 0.5
+  save_every: 1 
+  label_smoothing: 0.1
+  early_stopping_patience: 2
+  use_amp: true
+  resume_from: ""
+  
+model:
+  src_vocab_size: 70
+  tgt_vocab_size: 70
+  d_model: 768
+  n_heads: 12
+  n_layers: 10
+  dropout: 0.1
+  d_ff: 3072
+  
+logging:
+  log_every: 50
