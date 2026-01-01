@@ -8,6 +8,7 @@ import os
 import math
 from data import get_dataloaders
 from model import Transformer, create_padding_mask, create_causal_mask
+import torch.nn.functional as F
 import pickle
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -41,7 +42,7 @@ def train_epoch(model, loader, optimizer, criterion, device, epoch, config, hist
     optimizer.zero_grad() # Reset gradients
     
     accum_steps = config['training'].get('accumulation_steps', 1)
-    total_loss, total_acc = 0, 0
+    total_loss, total_acc, total_move_acc = 0, 0, 0
     num_batches = 0
     
     for batch_idx, batch in enumerate(loader):
@@ -54,13 +55,13 @@ def train_epoch(model, loader, optimizer, criterion, device, epoch, config, hist
         tgt_mask = tgt_pad_mask & tgt_causal_mask
         
         # FORWARD PASS with Mixed Precision
-        with torch.amp.autocast('cuda', enabled=config['training'].get('use_amp', True)):
-            output = model(batch['src'], batch['tgt_input'], src_mask, tgt_mask)
-            raw_loss = criterion(
-                output.reshape(-1, output.size(-1)), 
-                batch['tgt_output'].reshape(-1)
-            )
-            # Scale the loss by accum_steps to ensure the gradient average is correct
+        with torch.amp.autocast(device.type, enabled=config['training'].get('use_amp', True) and device.type == 'cuda'):
+            policy_out, value_out = model(batch['src'], batch['tgt_input'], src_mask, tgt_mask)
+
+            p_loss = criterion(policy_out.reshape(-1, policy_out.size(-1)), batch['tgt_output'].reshape(-1))
+            v_loss = F.mse_loss(value_out.squeeze(-1), batch['value'])
+            raw_loss = p_loss + (1.0 * v_loss) # Total Loss
+
             loss = raw_loss / accum_steps
         
         # BACKWARD PASS with Scaler
@@ -77,7 +78,13 @@ def train_epoch(model, loader, optimizer, criterion, device, epoch, config, hist
             scheduler.step()     
         
         # ACCURACY (Ignore padding tokens)
-        preds = output.argmax(-1).reshape(-1)
+        preds_raw = policy_out.argmax(-1)
+        # Mask out padding
+        mask = (batch['tgt_output'] != 0)
+        move_correct = ((preds_raw == batch['tgt_output']) | ~mask).all(dim=1)
+        move_acc = move_correct.float().mean().item()
+
+        preds = preds_raw.reshape(-1)
         targets = batch['tgt_output'].reshape(-1)
         non_pad_mask = (targets != 0)
         correct = (preds == targets) & non_pad_mask
@@ -85,18 +92,20 @@ def train_epoch(model, loader, optimizer, criterion, device, epoch, config, hist
         
         total_loss += raw_loss.item()
         total_acc += acc
+        total_move_acc += move_acc
         num_batches += 1
         
         if batch_idx % config['logging']['log_every'] == 0:
             print(f"Epoch {epoch+1}, Batch {batch_idx}/{len(loader)}, "
-                  f"Loss: {raw_loss.item():.4f}, Acc: {acc:.3f}, LR: {optimizer.param_groups[0]['lr']:.2e}")
+                  f"Loss: {raw_loss.item():.4f} (P:{p_loss.item():.3f} V:{v_loss.item():.3f}), "
+                  f"Acc: {acc:.3f}, MoveAcc: {move_acc:.3f}, LR: {optimizer.param_groups[0]['lr']:.2e}")
         
     return total_loss / num_batches, total_acc / num_batches
 
 @torch.no_grad()
 def validate_epoch(model, loader, criterion, device, config):
     model.eval()
-    total_loss, total_acc = 0, 0
+    total_loss, total_acc, total_move_acc = 0, 0, 0
     num_batches = 0
     
     for batch in loader:
@@ -108,22 +117,32 @@ def validate_epoch(model, loader, criterion, device, config):
         tgt_causal_mask = create_causal_mask(batch['tgt_input'].size(1)).to(device)
         tgt_mask = tgt_pad_mask & tgt_causal_mask
         
-        output = model(batch['src'], batch['tgt_input'], src_mask, tgt_mask)
-        loss = criterion(output.reshape(-1, output.size(-1)), 
-                        batch['tgt_output'].reshape(-1))
+
+        policy_out, value_out = model(batch['src'], batch['tgt_input'], src_mask, tgt_mask)
+
+        p_loss = criterion(policy_out.reshape(-1, policy_out.size(-1)), batch['tgt_output'].reshape(-1))
+        v_loss = F.mse_loss(value_out.squeeze(-1), batch['value'])
+        loss = p_loss + v_loss
+
         
         # Validation Accuracy, ignore padding
-        preds = output.argmax(-1).reshape(-1)
+        preds_raw = policy_out.argmax(-1)
+        mask = (batch['tgt_output'] != 0)
+        move_acc = ((preds_raw == batch['tgt_output']) | ~mask).all(dim=1).float().mean().item()
+
+        preds = preds_raw.reshape(-1)
         targets = batch['tgt_output'].reshape(-1)
         non_pad_mask = (targets != 0)
         correct = (preds == targets) & non_pad_mask
-        acc = correct.sum().item() / non_pad_mask.sum().item()
+        acc = correct.sum().item() / (non_pad_mask.sum().item() + 1e-9)
         
         total_loss += loss.item()
         total_acc += acc
+        total_move_acc += move_acc
         num_batches += 1
     
     return total_loss / num_batches, total_acc / num_batches
+
 
 def plot_training_curves(history, config, plot_dir="plots"):
     """Plot at the end of epochs"""
@@ -169,7 +188,7 @@ def main():
         num_samples=5000000
     )
 
-    # Save tokenizers for translation
+    # Save tokenizers
     with open(os.path.join(model_dir, "chess_tokenizer.pkl"), "wb") as f:
         pickle.dump(tokenizer, f)
     print("Chess Tokenizer saved!")
@@ -190,7 +209,7 @@ def main():
         weight_decay=config['training']['weight_decay']
     )
     
-    scaler = torch.amp.GradScaler('cuda', enabled=config['training'].get('use_amp', True))
+    scaler = torch.amp.GradScaler(device.type, enabled=config['training'].get('use_amp', True) and device.type == 'cuda')
     
     # SCHEDULER
     accum_steps = config['training'].get('accumulation_steps', 1)
@@ -216,10 +235,14 @@ def main():
     # RESUME TRAINING?
     resume_path = config['training'].get('resume_from')
     if resume_path and os.path.exists(resume_path):
-        last_epoch, history, best_val_loss = load_checkpoint(
-            resume_path, model, optimizer, scheduler, scaler
-        )
-        start_epoch = last_epoch + 1
+        print(f"Loading Pre-trained Weights from: {resume_path}")
+        checkpoint = torch.load(resume_path, map_location=device)
+        if 'model_state' in checkpoint:
+            model.load_state_dict(checkpoint['model_state'])
+        else:
+            model.load_state_dict(checkpoint)
+            
+        print("Weights loaded! Starting fresh Fine-Tuning session.")
     
     # TRAINING LOOP
     for epoch in range(start_epoch, config['training']['epochs']):
