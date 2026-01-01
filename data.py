@@ -9,10 +9,14 @@ BOS_IDX = 2
 EOS_IDX = 3
 
 
-CHESS_VOCAB = "<pad> <unk> <bos> <eos> 0 1 2 3 4 5 6 7 8 9 / a b c d e f g h p n b r q k P N B R Q K w - K Q q k  ".split(' ')
-char_to_id = {char: i for i, char in enumerate(CHESS_VOCAB) if char != ''}
-if ' ' not in char_to_id:
-    char_to_id[' '] = len(char_to_id)
+chars = "0123456789/abcdefghpnbrqkPNBRQKw- "
+unique_chars = []
+for c in chars:
+    if c not in unique_chars:
+        unique_chars.append(c)
+
+CHESS_VOCAB = ["<pad>", "<unk>", "<bos>", "<eos>"] + unique_chars
+char_to_id = {char: i for i, char in enumerate(CHESS_VOCAB)}
 id_to_char = {i: char for char, i in char_to_id.items()}
 
 
@@ -45,6 +49,7 @@ class ChessDataset(Dataset):
     def __init__(self, jsonl_file, tokenizer, num_samples=5000000, max_len_src=100, max_len_tgt=10):
         self.src_tensors = []
         self.tgt_tensors = []
+        self.val_labels = []
 
         print(f"Loading and Tokenizing {num_samples} Chess positions...")
         with open(jsonl_file, 'r') as f:
@@ -60,6 +65,7 @@ class ChessDataset(Dataset):
 
                 self.src_tensors.append(torch.tensor(s_ids, dtype=torch.int16))
                 self.tgt_tensors.append(torch.tensor(t_ids, dtype=torch.int16))
+                self.val_labels.append(data['val'])
 
                 if i % 500000 == 0 and i > 0:
                     print(f"Loaded {i} samples...")
@@ -71,7 +77,8 @@ class ChessDataset(Dataset):
         return{
             'src': self.src_tensors[idx].long(),
             'tgt_input': self.tgt_tensors[idx][:-1].long(),
-            'tgt_output': self.tgt_tensors[idx][1:].long()
+            'tgt_output': self.tgt_tensors[idx][1:].long(),
+            'value': torch.tensor(self.val_labels[idx], dtype=torch.float32)
         }
 
 
