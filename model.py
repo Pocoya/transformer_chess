@@ -31,8 +31,18 @@ class Transformer(nn.Module):
         self.decoder = nn.ModuleList([DecoderLayer(d_model, n_heads, dropout, d_ff) for _ in range(n_layers)])
         
         self.final_norm = nn.LayerNorm(d_model)
-        self.output_layer = nn.Linear(d_model, tgt_vocab_size)
-        
+
+        # The move
+        self.policy_head = nn.Linear(d_model, tgt_vocab_size)
+        # Win prob.
+        self.value_head = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 2, 1),
+            nn.Tanh()
+        )
+
         self._reset_parameters()
 
     def _reset_parameters(self):
@@ -41,19 +51,27 @@ class Transformer(nn.Module):
                 nn.init.xavier_uniform_(p)
 
     def forward(self, src, tgt_input, src_mask=None, tgt_mask=None):
-        # Embed and scale
+        # ENCODER
         src_emb = self.pos_encoding(self.src_embedding(src) * math.sqrt(self.d_model))
-        tgt_emb = self.pos_encoding(self.tgt_embedding(tgt_input) * math.sqrt(self.d_model))
-
         enc_out = src_emb
         for layer in self.encoder:
             enc_out = layer(enc_out, src_mask)
-        
+
+        # DECODER
+        tgt_emb = self.pos_encoding(self.tgt_embedding(tgt_input) * math.sqrt(self.d_model))
         dec_out = tgt_emb
         for layer in self.decoder:
             dec_out = layer(dec_out, enc_out, tgt_mask, src_mask)
 
-        return self.output_layer(self.final_norm(dec_out))
+        normalized_enc = self.final_norm(enc_out)
+        normalized_dec = self.final_norm(dec_out)
+
+        # Move logits
+        policy_logits = self.policy_head(normalized_dec)
+
+        board_summary = normalized_enc[:, 0, :] 
+        value = self.value_head(board_summary)
+        return policy_logits, value
 
 
 class MultiHeadAttention(nn.Module):
@@ -67,19 +85,17 @@ class MultiHeadAttention(nn.Module):
         self.out_proj = nn.Linear(d_model, d_model)
         self.dropout = dropout
 
-    def forward(self, x, mask=None, kv_source=None):
+    def forward(self, x, mask=None, kv_source=None, is_causal=False):
         batch_size, seq_len, d_model = x.shape
         
         # Self-attention or Cross-attention logic
         if kv_source is None:
             qkv = self.qkv_proj(x).view(batch_size, seq_len, 3, self.n_heads, self.d_k)
-            q, k, v = qkv.unbind(2) # split into Q, K, V
+            q, k, v = qkv.unbind(2)
             q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
         else:
-            # Cross-attention: Q comes from x, K/V from encoder output
             qkv_x = self.qkv_proj(x).view(batch_size, seq_len, 3, self.n_heads, self.d_k)
             q = qkv_x[:, :, 0].transpose(1, 2)
-            
             qkv_kv = self.qkv_proj(kv_source).view(batch_size, kv_source.size(1), 3, self.n_heads, self.d_k)
             k = qkv_kv[:, :, 1].transpose(1, 2)
             v = qkv_kv[:, :, 2].transpose(1, 2)
@@ -88,11 +104,12 @@ class MultiHeadAttention(nn.Module):
             q, k, v, 
             attn_mask=mask, 
             dropout_p=self.dropout if self.training else 0,
-            is_causal=False
+            is_causal=is_causal
         )
         
         attn_out = attn_out.transpose(1, 2).contiguous().view(batch_size, seq_len, d_model)
         return self.out_proj(attn_out)
+
 
 class EncoderLayer(nn.Module):
     def __init__(self, d_model, n_heads, dropout, d_ff):
@@ -132,8 +149,9 @@ class DecoderLayer(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, enc_out, tgt_mask=None, src_mask=None):
-        x = x + self.dropout(self.self_attn(self.norm1(x), tgt_mask))
-        x = x + self.dropout(self.cross_attn(self.norm2(x), src_mask, kv_source=enc_out))
+        x = x + self.dropout(self.self_attn(self.norm1(x), tgt_mask, is_causal=False)) 
+        # Cross-attention
+        x = x + self.dropout(self.cross_attn(self.norm2(x), src_mask, kv_source=enc_out, is_causal=False))
         x = x + self.dropout(self.ff(self.norm3(x)))
         return x
 
