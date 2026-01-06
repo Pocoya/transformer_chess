@@ -21,12 +21,10 @@ class Transformer(nn.Module):
         super().__init__()
         self.d_model = d_model
         
-        # SHARED EMBEDDING SCALING
         self.src_embedding = nn.Embedding(src_vocab_size, d_model)
         self.tgt_embedding = nn.Embedding(tgt_vocab_size, d_model)
         self.pos_encoding = PositionalEncoding(d_model)
         
-        # PRE-NORM ARCHITECTURE
         self.encoder = nn.ModuleList([EncoderLayer(d_model, n_heads, dropout, d_ff) for _ in range(n_layers)])
         self.decoder = nn.ModuleList([DecoderLayer(d_model, n_heads, dropout, d_ff) for _ in range(n_layers)])
         
@@ -126,7 +124,6 @@ class EncoderLayer(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, mask=None):
-        # Norm applied BEFORE the sub-layer
         x = x + self.dropout(self.attn(self.norm1(x), mask))
         x = x + self.dropout(self.ff(self.norm2(x)))
         return x
